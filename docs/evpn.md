@@ -81,8 +81,9 @@ BMP output includes EVPN in live rebuilt updates and initial RIB dumps,
 retaining next hops, communities, and ADD-PATH IDs. Synthetic Peer Up messages
 and End-of-RIB markers include EVPN when advertised by the source peer.
 BGP4MP MRT updates use the same decoder; TABLE_DUMP_V2 EVPN import is not
-implemented. The existing CLI route commands and ClickHouse route schema do
-not expose EVPN; use the HTTP API or BMP output.
+implemented. Use [`netom-cli show evpn`](cli.md#evpn-routes) for interactive
+inspection.
+The ClickHouse route schema does not expose EVPN.
 
 Roto route filters can use `is_evpn()` and `evpn_rd()`. `fmt_prefix()` returns
 the type 2 host or type 5 prefix; EVPN routes without an IP prefix return
