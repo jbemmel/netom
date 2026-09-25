@@ -60,6 +60,7 @@ pub enum RotondaRoute {
         routecore::bgp::nlri::afisafi::Ipv6FlowSpecNlri<Bytes>,
         RotondaPaMap,
     ),
+    L2VpnEvpn(crate::units::rib_unit::evpn::EvpnNlri, RotondaPaMap),
     // TODO support all routecore AfiSafiTypes
 }
 
@@ -70,6 +71,7 @@ impl Serialize for RotondaRoute {
     {
         let mut s = serializer.serialize_struct("Route", 2)?;
         match self {
+            RotondaRoute::L2VpnEvpn(n, _) => s.serialize_field("evpn", n),
             RotondaRoute::Ipv4Unicast(n, _) => s.serialize_field("prefix", n),
             RotondaRoute::Ipv6Unicast(n, _) => s.serialize_field("prefix", n),
             RotondaRoute::Ipv4Multicast(n, _) => {
@@ -98,6 +100,7 @@ impl RotondaRoute {
         &self,
     ) -> routecore::bgp::path_attributes::OwnedPathAttributes {
         match self {
+            RotondaRoute::L2VpnEvpn(_, p) => p.path_attributes(),
             RotondaRoute::Ipv4Unicast(_, p) => p.path_attributes(),
             RotondaRoute::Ipv6Unicast(_, p) => p.path_attributes(),
             RotondaRoute::Ipv4Multicast(_, p) => p.path_attributes(),
@@ -109,6 +112,7 @@ impl RotondaRoute {
 
     pub fn rotonda_pamap(&self) -> &RotondaPaMap {
         match self {
+            RotondaRoute::L2VpnEvpn(_, p) => p,
             RotondaRoute::Ipv4Unicast(_, p) => p,
             RotondaRoute::Ipv6Unicast(_, p) => p,
             RotondaRoute::Ipv4Multicast(_, p) => p,
@@ -120,6 +124,7 @@ impl RotondaRoute {
 
     pub fn rotonda_pamap_mut(&mut self) -> &mut RotondaPaMap {
         match self {
+            RotondaRoute::L2VpnEvpn(_, ref mut p) => p,
             RotondaRoute::Ipv4Unicast(_, ref mut p) => p,
             RotondaRoute::Ipv6Unicast(_, ref mut p) => p,
             RotondaRoute::Ipv4Multicast(_, ref mut p) => p,
@@ -129,15 +134,20 @@ impl RotondaRoute {
         }
     }
 
-    /// The prefix under which this route is keyed in the RIB.
+    /// Prefix exposed to IP-oriented filters. EVPN storage uses its own RD-scoped key.
     ///
     /// For unicast/multicast this is the NLRI prefix. For FlowSpec it is
     /// the destination-prefix component when one is usable as a key (always
     /// for IPv4; for IPv6 only when the pattern offset is 0), otherwise the
     /// family default route (`0.0.0.0/0` / `::/0`). roto scripts, the HTTP
     /// API and the store all derive the key through this one helper.
+    /// For EVPN this is the type-2 host or type-5 prefix; routes without
+    /// an IP prefix return 0.0.0.0/0. Use is_evpn() before IP-only policy.
     pub fn index_prefix(&self) -> inetnum::addr::Prefix {
         match self {
+            RotondaRoute::L2VpnEvpn(n, _) => {
+                n.prefix.unwrap_or_else(|| "0.0.0.0/0".parse().unwrap())
+            }
             RotondaRoute::Ipv4Unicast(n, _) => n.prefix(),
             RotondaRoute::Ipv6Unicast(n, _) => n.prefix(),
             RotondaRoute::Ipv4Multicast(n, _) => n.prefix(),
@@ -168,6 +178,9 @@ impl RotondaRoute {
 impl fmt::Display for RotondaRoute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RotondaRoute::L2VpnEvpn(n, ..) => {
+                write!(f, "RR-EVPN {} {}", n.route_type, n.rd)
+            }
             RotondaRoute::Ipv4Unicast(p, ..) => {
                 write!(f, "RR-Ipv4Unicast {}", p)
             }
