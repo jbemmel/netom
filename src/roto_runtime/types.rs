@@ -746,6 +746,31 @@ pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
             )
         }
 
+        Nlri::L2VpnEvpn(n) => {
+            use routecore::bgp::nlri::afisafi::NlriCompose;
+            let mut raw = Vec::new();
+            n.compose(&mut raw).map_err(|_| ())?;
+            (
+                RotondaRoute::L2VpnEvpn(
+                    crate::units::rib_unit::evpn::EvpnNlri::parse(&raw)?,
+                    pamap,
+                ),
+                None,
+            )
+        }
+        Nlri::L2VpnEvpnAddpath(n) => {
+            use routecore::bgp::nlri::afisafi::NlriCompose;
+            let mut raw = Vec::new();
+            n.compose(&mut raw).map_err(|_| ())?;
+            (
+                RotondaRoute::L2VpnEvpn(
+                    crate::units::rib_unit::evpn::EvpnNlri::parse(&raw[4..])?,
+                    pamap,
+                ),
+                Some(n.path_id()),
+            )
+        }
+
         Nlri::Ipv4MplsUnicast(..)
         | Nlri::Ipv4MplsUnicastAddpath(..)
         | Nlri::Ipv4MplsVpnUnicast(..)
@@ -757,9 +782,7 @@ pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
         | Nlri::Ipv6MplsVpnUnicast(..)
         | Nlri::Ipv6MplsVpnUnicastAddpath(..)
         | Nlri::L2VpnVpls(..)
-        | Nlri::L2VpnVplsAddpath(..)
-        | Nlri::L2VpnEvpn(..)
-        | Nlri::L2VpnEvpnAddpath(..) => {
+        | Nlri::L2VpnVplsAddpath(..) => {
             note_unsupported_nlri(nlri.nlri_type());
             debug!(
                 "NLRI type {:?} not yet supported in RotondaRoute: {}",

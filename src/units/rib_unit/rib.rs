@@ -160,6 +160,7 @@ type RotoHttpFilter = roto::TypedFunc<
 
 #[derive(Clone)]
 pub struct Rib {
+    evpn: Arc<Mutex<HashMap<(Vec<u8>, IngressId), super::evpn::EvpnRecord>>>,
     unicast: Arc<Option<Store>>,
     multicast: Arc<Option<Store>>,
     /// FlowSpec rules (SAFI 133, v4+v6 in the one dual-family store), keyed
@@ -241,6 +242,7 @@ fn reset_peer_gauge(mui: IngressId, family: Option<AfiSafiType>) {
                 AfiSafiType::Ipv6Multicast => (2, 2),
                 AfiSafiType::Ipv4FlowSpec => (1, 133),
                 AfiSafiType::Ipv6FlowSpec => (2, 133),
+                AfiSafiType::L2VpnEvpn => (25, 70),
                 // Families we never store; nothing was ever counted.
                 _ => return,
             };
@@ -274,6 +276,7 @@ impl Rib {
         Ok(Rib {
             unicast: Arc::new(Some(Store::try_default()?)),
             multicast: Arc::new(Some(Store::try_default()?)),
+            evpn: Arc::default(),
             flowspec: Arc::new(Some(FlowSpecStore::try_default()?)),
             flowspec_rule_counts,
             ingress_register,
@@ -554,6 +557,53 @@ impl Rib {
         deduplicate_path_attributes: bool,
     ) -> Result<UpsertReport, String> {
         let res = match val {
+            RotondaRoute::L2VpnEvpn(n, attributes) => {
+                let mut records =
+                    self.evpn.lock().unwrap_or_else(|e| e.into_inner());
+                let key = (n.key.clone(), ingress_id);
+                let existed = records.contains_key(&key);
+                let was_active = records.get(&key).is_some_and(|r| r.active);
+                let active = route_status == RouteStatus::Active;
+                if let Some(gauge) = peer_gauge(ingress_id) {
+                    if active && !was_active {
+                        gauge.add_adj_rib_in((25, 70), 1);
+                    }
+                    if !active && was_active {
+                        gauge.sub_adj_rib_in((25, 70), 1);
+                    }
+                }
+                if active {
+                    records.insert(
+                        key,
+                        super::evpn::EvpnRecord {
+                            ingress_id,
+                            ltime,
+                            active,
+                            nlri: n.clone(),
+                            attributes: if deduplicate_path_attributes {
+                                attributes
+                                    .dedup_with(&self.path_attribute_interner)
+                            } else {
+                                attributes.clone()
+                            },
+                        },
+                    );
+                } else if retain_withdrawn_attributes {
+                    if let Some(record) = records.get_mut(&key) {
+                        record.active = false;
+                        record.ltime = ltime;
+                    }
+                } else {
+                    records.remove(&key);
+                }
+                Ok(UpsertReport {
+                    cas_count: 0,
+                    prefix_new: !existed && active,
+                    mui_new: !existed && active,
+                    mui_count: usize::from(active),
+                })
+            }
+
             RotondaRoute::Ipv4Unicast(n, ..) => self.insert_prefix(
                 &n.prefix(),
                 Multicast(false),
@@ -1271,6 +1321,26 @@ impl Rib {
             self.compact_withdrawn_attributes_for_ingresses(ids);
         }
 
+        {
+            let mut records =
+                self.evpn.lock().unwrap_or_else(|e| e.into_inner());
+            let evpn_ingresses: HashSet<_> = ids
+                .iter()
+                .filter(|(_, family)| {
+                    family.is_none()
+                        || *family == Some(AfiSafiType::L2VpnEvpn)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            records.retain(|(_, ingress), record| {
+                if evpn_ingresses.contains(ingress) {
+                    record.active = false;
+                    retain_withdrawn_attributes
+                } else {
+                    true
+                }
+            });
+        }
         for (ingress_id, specific_afisafi) in ids {
             debug!("withdraw_for_ingress for {ingress_id}");
             reset_peer_gauge(*ingress_id, *specific_afisafi);
@@ -1383,6 +1453,7 @@ impl Rib {
                     }
                 }
 
+                Some(AfiSafiType::L2VpnEvpn) => (), // handled above
                 afisafi => {
                     // Reachable for families we never store (they are
                     // dropped at the TryFrom chokepoint), so log instead
@@ -1407,7 +1478,20 @@ impl Rib {
     /// retained previous session before reusing an id. Synthesized BMP peers
     /// that mint a fresh ingress id every session must take this path so
     /// mark-withdraw does not leak one record slot per announced prefix.
+    pub fn evpn_records(&self) -> Vec<super::evpn::EvpnRecord> {
+        self.evpn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub fn remove_for_ingresses(&self, ids: &[IngressId]) {
+        self.evpn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, ingress), _| !ids.contains(ingress));
         if ids.is_empty() {
             return;
         }
@@ -1513,6 +1597,7 @@ impl Rib {
                 Some(AfiSafiType::Ipv6FlowSpec) => {
                     v6_fs.insert(*id);
                 }
+                Some(AfiSafiType::L2VpnEvpn) => (), // separate EVPN store
                 afisafi => {
                     warn!(
                         "no support to compact withdrawn attributes for {:?} yet",
@@ -1807,7 +1892,14 @@ impl Rib {
         // chunks under short-lived guards, the way the jsonl dump does it:
         // one guard held across the whole table would pin concurrent churn
         // garbage for the length of the walk.
-        let mut active_muis: HashSet<IngressId> = HashSet::new();
+        let mut active_muis: HashSet<IngressId> = self
+            .evpn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|r| r.active)
+            .map(|r| r.ingress_id)
+            .collect();
         for store in [self.unicast.as_ref(), self.multicast.as_ref()]
             .into_iter()
             .flatten()
@@ -4128,6 +4220,56 @@ mod tests {
     */
 
     // ------------ FlowSpec store ------------------------------------------
+
+    #[test]
+    fn evpn_tenants_paths_and_peer_lifecycle() {
+        use super::super::evpn::EvpnNlri;
+        fn route(rd: u8, vni: u8) -> RotondaRoute {
+            let mut raw = vec![5, 34];
+            raw.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, rd]);
+            raw.extend_from_slice(&[0; 14]);
+            raw.extend_from_slice(&[24, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, vni]);
+            RotondaRoute::L2VpnEvpn(
+                EvpnNlri::parse(&raw).unwrap(),
+                RotondaPaMap::empty_path_attributes(),
+            )
+        }
+        let rib = test_rib();
+        for (rd, ingress) in [(1, 1), (2, 1), (1, 2)] {
+            rib.insert(
+                &route(rd, 10),
+                RouteStatus::Active,
+                0,
+                ingress,
+                true,
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(rib.evpn_records().len(), 3);
+        rib.insert(&route(1, 20), RouteStatus::Active, 1, 1, true, false)
+            .unwrap();
+        assert_eq!(rib.evpn_records().len(), 3);
+        rib.insert(&route(1, 0), RouteStatus::Withdrawn, 2, 1, true, false)
+            .unwrap();
+        let rows = rib.evpn_records();
+        assert_eq!(rows.iter().filter(|r| r.active).count(), 2);
+        assert_eq!(
+            rows.iter().find(|r| !r.active).unwrap().nlri.labels,
+            vec![20]
+        );
+        rib.withdraw_for_ingress(1, Some(AfiSafiType::Ipv4Unicast), false);
+        assert_eq!(rib.evpn_records().len(), 3);
+        rib.withdraw_for_ingress(1, Some(AfiSafiType::L2VpnEvpn), false);
+        assert_eq!(rib.evpn_records().len(), 1);
+        rib.insert(&route(2, 30), RouteStatus::Active, 3, 1, false, false)
+            .unwrap();
+        assert_eq!(rib.evpn_records().len(), 2);
+        rib.remove_for_ingresses(&[2]);
+        assert_eq!(rib.evpn_records().len(), 1);
+        rib.withdraw_for_ingress(1, None, false);
+        assert!(rib.evpn_records().is_empty());
+    }
 
     fn test_rib() -> Rib {
         Rib::new(Default::default(), None, Arc::new(Mutex::new(Ctx::empty())))
