@@ -2516,3 +2516,94 @@ fn assert_invalid_msg_starts_with(
         );
     }
 }
+
+#[test]
+fn implicit_peer_down_replaces_session_and_cleans_all_children() {
+    use crate::ingress::register::IngressState;
+    use routecore::bgp::nlri::common::PathId;
+
+    for updating in [false, true] {
+        let (_, peer_up, pph) =
+            mk_peer_up_notification_msg_without_rfc4724_support(
+                "127.0.0.1",
+                12345,
+            );
+        let (_, other_up, other_pph) =
+            mk_peer_up_notification_msg_without_rfc4724_support(
+                "127.0.0.2",
+                12345,
+            );
+        let mut processor = mk_test_processor()
+            .process_msg(
+                Instant::now(),
+                mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC),
+                None,
+            )
+            .next_state;
+        assert!(processor.implicit_peer_down(&pph).is_none());
+        processor = processor
+            .process_msg(Instant::now(), peer_up.clone(), None)
+            .next_state;
+        processor = processor
+            .process_msg(Instant::now(), other_up, None)
+            .next_state;
+
+        let mut post = mk_per_peer_header("127.0.0.1", 12345);
+        post.peer_flags = 0x40;
+        processor = processor
+            .process_msg(Instant::now(), mk_route_monitoring_msg(&post), None)
+            .next_state;
+        let BmpState::Dumping(ref mut state) = processor else {
+            panic!("expected Dumping")
+        };
+        let parent = state.details.get_peer_ingress_id(&pph).unwrap();
+        let other = state.details.get_peer_ingress_id(&other_pph).unwrap();
+        let register = state.ingress_register.clone();
+        let (child, _) = state
+            .details
+            .get_or_create_path_child(&pph, PathId(7), &register)
+            .unwrap();
+        if updating {
+            let BmpState::Dumping(state) = processor else {
+                unreachable!()
+            };
+            processor = BmpState::Updating(state.into());
+        }
+
+        let Update::WithdrawBulk(entries) =
+            processor.implicit_peer_down(&pph).unwrap()
+        else {
+            panic!("expected parent, policy sibling and ADD-PATH withdrawals")
+        };
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().any(|(id, _)| *id == parent));
+        assert!(entries.iter().any(|(id, _)| *id == child));
+        for (id, _) in entries.iter() {
+            assert_eq!(
+                register.get(*id).unwrap().state,
+                Some(IngressState::Disconnected)
+            );
+        }
+        assert_eq!(
+            register.get(other).unwrap().state,
+            Some(IngressState::Connected)
+        );
+        assert!(processor.implicit_peer_down(&pph).is_none());
+        let result = processor.process_msg(Instant::now(), peer_up, None);
+        assert!(
+            matches!(result.message_type, MessageType::RoutingUpdate { update: Update::IngressReappeared(id), .. } if id == parent)
+        );
+        assert_eq!(
+            register.get(parent).unwrap().state,
+            Some(IngressState::Connected)
+        );
+        assert_eq!(
+            register.get(child).unwrap().state,
+            Some(IngressState::Disconnected)
+        );
+        assert_eq!(
+            matches!(result.next_state, BmpState::Updating(_)),
+            updating
+        );
+    }
+}

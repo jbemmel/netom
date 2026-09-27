@@ -72,6 +72,7 @@ pub struct RouterHandler {
     /// (see the unit's `forward_raw_updates` config). Captured at connection
     /// accept.
     forward_raw_updates: bool,
+    implicit_peer_down: bool,
 }
 
 impl RouterHandler {
@@ -90,6 +91,7 @@ impl RouterHandler {
         ingress_register: Arc<ingress::Register>,
         ignore_post_policy_routes: bool,
         forward_raw_updates: bool,
+        implicit_peer_down: bool,
     ) -> Self {
         Self {
             gate,
@@ -106,6 +108,7 @@ impl RouterHandler {
             ingress_register,
             ignore_post_policy_routes,
             forward_raw_updates,
+            implicit_peer_down,
         }
     }
 
@@ -153,6 +156,7 @@ impl RouterHandler {
             ingress_register: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            implicit_peer_down: false,
         };
 
         (mock, gate_agent, parent_gate)
@@ -436,7 +440,7 @@ impl RouterHandler {
         let mut bmp_state_lock = self.state_machine.lock().await;
 
         // SAFETY: Each connection should always have a state machine.
-        let bmp_state = bmp_state_lock.take().unwrap();
+        let mut bmp_state = bmp_state_lock.take().unwrap();
 
         if let Some(last_msg_at) = &self.last_msg_at {
             if let Ok(mut guard) = last_msg_at.write() {
@@ -615,6 +619,17 @@ impl RouterHandler {
                 self.status_reporter
                     .message_processed(bmp_state.router_id());
 
+                if self.implicit_peer_down {
+                    if let Message::PeerUpNotification(ref peer_up) = msg {
+                        if let Some(update) = bmp_state
+                            .implicit_peer_down(&peer_up.per_peer_header())
+                        {
+                            // Withdraw the old session before the new Peer Up
+                            // reclaims its ingress and emits IngressReappeared.
+                            self.gate.update_data(update).await;
+                        }
+                    }
+                }
                 let mut res = bmp_state.process_msg(received, msg, trace_id);
 
                 match res.message_type {
@@ -1019,6 +1034,87 @@ mod tests {
             &metrics, OTHER_SYS_NAME, "bmp_tcp_in_num_bmp_messages_received",
             "msg_type", "Peer Down Notification", 1
         ); // from 5
+    }
+
+    #[tokio::test]
+    async fn implicit_peer_down_option_controls_duplicate_peer_up() {
+        #[derive(Debug, Default)]
+        struct Updates(std::sync::Mutex<Vec<Update>>);
+        #[async_trait::async_trait]
+        impl crate::comms::DirectUpdate for Updates {
+            async fn direct_update(&self, update: Update) {
+                self.0.lock().unwrap().push(update);
+            }
+        }
+        impl crate::comms::AnyDirectUpdate for Updates {}
+
+        for enabled in [false, true] {
+            let (mut runner, mut agent, gate) = RouterHandler::mock();
+            let updates = Arc::new(Updates::default());
+            let mut link =
+                crate::comms::DirectLink::from(agent.create_link());
+            let gate_task = tokio::spawn(async move {
+                loop {
+                    if gate.process().await.is_err() {
+                        break;
+                    }
+                }
+            });
+            link.connect(updates.clone(), false).await.unwrap();
+            runner.implicit_peer_down = enabled;
+            process_msg(
+                &runner,
+                Message::from_octets(mk_initiation_msg(SYS_NAME, SYS_DESCR))
+                    .unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
+            let pph = mk_per_peer_header("10.0.0.1", 12345);
+            let up = Message::from_octets(
+                crate::bgp::encode::mk_peer_up_notification_msg(
+                    &pph,
+                    "10.0.0.2".parse().unwrap(),
+                    179,
+                    1234,
+                    111,
+                    222,
+                    0,
+                    0,
+                    vec![],
+                    false,
+                ),
+            )
+            .unwrap();
+            process_msg(&runner, up.clone(), 1).await.unwrap();
+            process_msg(&runner, up, 1).await.unwrap();
+            let metrics = get_testable_metrics_snapshot(
+                &runner.status_reporter.metrics().unwrap(),
+            );
+            assert_metric_value(
+                &metrics,
+                "1",
+                "bmp_in_num_invalid_bmp_messages",
+                usize::from(!enabled),
+            );
+            let updates = updates.0.lock().unwrap();
+            let session_updates: Vec<_> = updates
+                .iter()
+                .filter(|u| !matches!(u, Update::OutputStream(_)))
+                .collect();
+            if enabled {
+                assert_eq!(session_updates.len(), 2);
+                let Update::Withdraw(old, None) = session_updates[0] else {
+                    panic!("expected withdrawal first")
+                };
+                assert!(
+                    matches!(session_updates[1], Update::IngressReappeared(new) if new == old)
+                );
+            } else {
+                assert!(session_updates.is_empty());
+            }
+            gate_task.abort();
+        }
     }
 
     // --- Test helpers ------------------------------------------------------
