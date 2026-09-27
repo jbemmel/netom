@@ -56,7 +56,7 @@ connect, handshake, idle reads and retry delays. Downstream backpressure can
 still delay cleanup; the daemon's shutdown/drain rules apply.
 
 The existing filtering and tracing settings apply to active input as well.
-`ignore_post_policy_routes` and `forward_raw_updates` changes apply to the next
+`implicit_peer_down`, `ignore_post_policy_routes` and `forward_raw_updates` changes apply to the next
 connection. Listening address changes preserve existing accepted connections.
 
 ## History and initial data
@@ -85,3 +85,21 @@ Configure active inputs for these ports and include both in the history target's
 sources. The driver checks identical observations, IPv4/IPv6, ADD-PATH IDs, raw
 attributes, derived columns, and peer invalidations in ClickHouse. Its router
 names isolate each test from live feeds. It accepts one connection and exits.
+
+
+## Implicit peer down
+
+Set `implicit_peer_down = true` on a `bmp-tcp-in` unit to recover when an
+exporter sends a repeated Peer Up without a preceding Peer Down. The default
+is `false`, which preserves the existing duplicate-Peer-Up error behavior.
+
+For an already active peer in the same BMP router session, Netom runs normal
+Peer Down cleanup and forwards withdrawals before accepting the new Peer Up.
+Cleanup includes policy siblings and ADD-PATH children; the replacement session
+can reuse the disconnected ingress. Each implicit down logs a warning with the
+router and peer identity. Filter-rejected Peer Up messages do not trigger cleanup.
+
+The trigger uses the existing per-peer header identity (peer type, distinguisher,
+address, ASN, BGP router ID and flags). A first Peer Up for another policy view
+or a separate BMP connection does not trigger cleanup merely because its BGP
+router ID matches. Configuration changes apply to new BMP connections.

@@ -164,6 +164,11 @@ pub struct BmpTcpIn {
     /// connections accepted after a (re)configure.
     #[serde(default = "BmpTcpIn::default_forward_raw_updates")]
     pub forward_raw_updates: bool,
+
+    /// Clean up an active peer before accepting a repeated Peer Up.
+    /// Disabled by default; changes apply to new BMP connections.
+    #[serde(default)]
+    pub implicit_peer_down: bool,
 }
 
 impl BmpTcpIn {
@@ -243,6 +248,7 @@ impl BmpTcpIn {
             ingress_register,
             self.ignore_post_policy_routes,
             self.forward_raw_updates,
+            self.implicit_peer_down,
         )
         .run::<_, _, StandardTcpStream, BmpTcpInRunner>(Arc::new(
             StandardTcpListenerFactory,
@@ -309,6 +315,7 @@ struct BmpTcpInRunner {
     ingress_register: Arc<ingress::Register>,
     ignore_post_policy_routes: bool,
     forward_raw_updates: bool,
+    implicit_peer_down: bool,
 }
 
 impl BmpTcpInRunner {
@@ -337,6 +344,7 @@ impl BmpTcpInRunner {
         ingress_register: Arc<ingress::Register>,
         ignore_post_policy_routes: bool,
         forward_raw_updates: bool,
+        implicit_peer_down: bool,
     ) -> Self {
         Self {
             component,
@@ -357,6 +365,7 @@ impl BmpTcpInRunner {
             ingress_register,
             ignore_post_policy_routes,
             forward_raw_updates,
+            implicit_peer_down,
         }
     }
 
@@ -388,6 +397,7 @@ impl BmpTcpInRunner {
             roto_metrics: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            implicit_peer_down: false,
         };
 
         (runner, gate_agent)
@@ -660,6 +670,7 @@ impl BmpTcpInRunner {
             self.ingress_register.clone(),
             self.ignore_post_policy_routes,
             self.forward_raw_updates,
+            self.implicit_peer_down,
         );
 
         (child_name, router_handler, router_ingress_id)
@@ -694,6 +705,7 @@ impl BmpTcpInRunner {
                                         new_ignore_post_policy_routes,
                                     forward_raw_updates:
                                         new_forward_raw_updates,
+                                    implicit_peer_down: new_implicit_peer_down,
                                 }),
                         } => {
                             // Runtime reconfiguration of this unit has
@@ -717,6 +729,7 @@ impl BmpTcpInRunner {
                                 new_ignore_post_policy_routes;
                             self.forward_raw_updates =
                                 new_forward_raw_updates;
+                            self.implicit_peer_down = new_implicit_peer_down;
 
                             if rebind {
                                 // Trigger re-binding to the new listen port.
@@ -906,6 +919,22 @@ mod tests {
         assert!(mk_config_from_toml("listen = ''").is_err());
         assert!(mk_config_from_toml("listen = '12345'").is_err());
         assert!(mk_config_from_toml("listen = '1.2.3.4'").is_err());
+    }
+
+    #[test]
+    fn implicit_peer_down_config_defaults_to_disabled() {
+        assert!(
+            !mk_config_from_toml("listen = '127.0.0.1:11019'")
+                .unwrap()
+                .implicit_peer_down
+        );
+        assert!(
+            mk_config_from_toml(
+                "listen = '127.0.0.1:11019'\nimplicit_peer_down = true"
+            )
+            .unwrap()
+            .implicit_peer_down
+        );
     }
 
     #[test]
@@ -1127,6 +1156,7 @@ mod tests {
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            implicit_peer_down: false,
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1197,6 +1227,7 @@ mod tests {
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            implicit_peer_down: false,
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1271,6 +1302,7 @@ mod tests {
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            implicit_peer_down: false,
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1434,6 +1466,7 @@ mod tests {
             roto_metrics: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            implicit_peer_down: false,
         };
 
         (runner, gate_agent, status_reporter)

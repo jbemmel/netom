@@ -305,6 +305,30 @@ impl BmpState {
         }
     }
 
+    /// Clean up a repeated Peer Up within this router's BMP session.
+    /// A different policy view may legitimately send its own Peer Up, so
+    /// require an existing exact PPH before removing all identity siblings.
+    pub fn implicit_peer_down(
+        &mut self,
+        pph: &PerPeerHeader<Bytes>,
+    ) -> Option<Update> {
+        match self {
+            Self::Dumping(state)
+                if state.details.get_peer_config(pph).is_some() =>
+            {
+                warn!("Implicit peer down: router={} peer={}; Peer Up received for an existing session", state.router_id, pph);
+                state.cleanup_peer(pph)
+            }
+            Self::Updating(state)
+                if state.details.get_peer_config(pph).is_some() =>
+            {
+                warn!("Implicit peer down: router={} peer={}; Peer Up received for an existing session", state.router_id, pph);
+                state.cleanup_peer(pph)
+            }
+            _ => None,
+        }
+    }
+
     pub fn state_idx(&self) -> BmpStateIdx {
         match self {
             BmpState::Initiating(_) => BmpStateIdx::Initiating,
@@ -706,18 +730,20 @@ where
         mut self,
         msg: PeerDownNotification<Bytes>,
     ) -> ProcessingResult {
-        // Compatibility Note: RFC-7854 doesn't seem to indicate that a Peer
-        // Down Notification has a Per Peer Header, but if it doesn't how can
-        // we know which peer of the remote has gone down? Also, we see the
-        // Per Peer Header attached to Peer Down Notification BMP messages in
-        // packet captures so it seems that it is indeed sent.
         let pph = msg.per_peer_header();
+        match self.cleanup_peer(&pph) {
+            Some(update) => self.mk_routing_update_result(update),
+            None => self.mk_invalid_message_result(
+                "PeerDownNotification received for peer that was not 'up'",
+                Some(false),
+                Some(Bytes::copy_from_slice(msg.as_ref())),
+            ),
+        }
+    }
 
-        // We have to grab these before we remove the peer.
-        //let withdrawals = self.mk_withdrawals_for_peers_routes(&pph);
-        //let withdrawals = vec![];
-
-        let removed_peers = self.details.remove_peer_identity_siblings(&pph);
+    /// Shared cleanup for explicit and implicit Peer Down notifications.
+    fn cleanup_peer(&mut self, pph: &PerPeerHeader<Bytes>) -> Option<Update> {
+        let removed_peers = self.details.remove_peer_identity_siblings(pph);
         if !removed_peers.is_empty() {
             // Reap every PeerState that shares this peer's identity. The
             // rib_type/policy-flag workaround in route_monitoring() can
@@ -748,10 +774,7 @@ where
                 );
             }
 
-            // Build the WithdrawBulk and clean up the global ingress
-            // register. Synthesized ingresses are dropped so they
-            // don't accumulate across peer flaps; the original
-            // (non-synthesized) ingress is preserved so the next
+            // Build withdrawals and clean up the global ingress register.
             // Both synthesized and non-synthesized peers are preserved in the
             // register as Disconnected (Layer D), so the next session can
             // rebind the same IngressId via find_existing_peer — synthesized
@@ -786,41 +809,14 @@ where
                 && !removed_peers[0].synthesized
                 && removed_peers[0].path_children.is_empty()
             {
-                self.mk_routing_update_result(Update::Withdraw(
-                    removed_peers[0].ingress_id,
-                    None,
-                ))
+                Some(Update::Withdraw(removed_peers[0].ingress_id, None))
             } else {
-                let entries = entries.into_iter().collect::<SmallVec<
-                    [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
-                >>();
-                self.mk_routing_update_result(Update::WithdrawBulk(Box::new(
-                    entries,
+                Some(Update::WithdrawBulk(Box::new(
+                    entries.into_iter().collect(),
                 )))
             }
-
-            /*
-            ProcessingResult::new(
-                MessageType::RoutingUpdate{
-                    update: Update::Withdraw(removed_peer.ingress_id, None),
-                },
-                self.into()
-            )
-                */
-            //}
         } else {
-            //if !self.details.remove_peer(&pph) {
-            // This is unexpected, we should have had configuration
-            // stored for this peer but apparently don't. Did we
-            // receive a Peer Down Notification without a
-            // corresponding prior Peer Up Notification for the same
-            // peer?
-            self.mk_invalid_message_result(
-                "PeerDownNotification received for peer that was not 'up'",
-                Some(false),
-                // TODO: Silly to_copy the bytes, but PDN won't give us the octets back..
-                Some(Bytes::copy_from_slice(msg.as_ref())),
-            )
+            None
         }
     }
 
