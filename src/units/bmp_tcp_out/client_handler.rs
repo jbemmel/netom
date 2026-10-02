@@ -479,9 +479,7 @@ pub async fn perform_initial_dump(
         };
         // EVPN uses RD-scoped keys instead of the IP prefix tree.
         if !client_gone {
-            for record in
-                rib_for_walk.evpn_records().into_iter().filter(|r| r.active)
-            {
+            for record in rib_for_walk.evpn_records_matching(|r| r.active) {
                 let source = ingress_register_for_walk.get(record.ingress_id);
                 let (ingress_id, path_id) = match source {
                     Some(ref info)
@@ -1420,7 +1418,10 @@ mod tests {
                 ),
             );
             let route = RotondaRoute::L2VpnEvpn(
-                crate::units::rib_unit::evpn::EvpnNlri::parse(&raw).unwrap(),
+                Box::new(
+                    crate::units::rib_unit::evpn::EvpnNlri::parse(&raw)
+                        .unwrap(),
+                ),
                 attrs,
             );
             rib.insert(&route, RouteStatus::Active, 0, child, true, false)
@@ -1474,10 +1475,9 @@ mod tests {
                 )
                 .unwrap();
                 let routes =
-                    crate::roto_runtime::types::explode_announcements(
-                        &update,
-                    )
-                    .unwrap();
+                    crate::roto_runtime::types::decode_evpn_test_update(
+                        &update, false,
+                    );
                 assert_eq!(routes.len(), 1);
                 assert_eq!(routes[0].1.unwrap().0, 11);
             }

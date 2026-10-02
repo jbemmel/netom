@@ -160,7 +160,9 @@ type RotoHttpFilter = roto::TypedFunc<
 
 #[derive(Clone)]
 pub struct Rib {
-    evpn: Arc<Mutex<HashMap<(Vec<u8>, IngressId), super::evpn::EvpnRecord>>>,
+    evpn: Arc<
+        Mutex<HashMap<(Vec<u8>, IngressId), Arc<super::evpn::EvpnRecord>>>,
+    >,
     unicast: Arc<Option<Store>>,
     multicast: Arc<Option<Store>>,
     /// FlowSpec rules (SAFI 133, v4+v6 in the one dual-family store), keyed
@@ -575,21 +577,22 @@ impl Rib {
                 if active {
                     records.insert(
                         key,
-                        super::evpn::EvpnRecord {
+                        Arc::new(super::evpn::EvpnRecord {
                             ingress_id,
                             ltime,
                             active,
-                            nlri: n.clone(),
+                            nlri: n.as_ref().clone(),
                             attributes: if deduplicate_path_attributes {
                                 attributes
                                     .dedup_with(&self.path_attribute_interner)
                             } else {
                                 attributes.clone()
                             },
-                        },
+                        }),
                     );
                 } else if retain_withdrawn_attributes {
                     if let Some(record) = records.get_mut(&key) {
+                        let record = Arc::make_mut(record);
                         record.active = false;
                         record.ltime = ltime;
                     }
@@ -600,7 +603,9 @@ impl Rib {
                     cas_count: 0,
                     prefix_new: !existed && active,
                     mui_new: !existed && active,
-                    mui_count: usize::from(active),
+                    // Withdrawals report prior existence so downstream
+                    // metrics can distinguish known and unannounced routes.
+                    mui_count: usize::from(active || existed),
                 })
             }
 
@@ -1334,7 +1339,9 @@ impl Rib {
                 .collect();
             records.retain(|(_, ingress), record| {
                 if evpn_ingresses.contains(ingress) {
-                    record.active = false;
+                    if retain_withdrawn_attributes && record.active {
+                        Arc::make_mut(record).active = false;
+                    }
                     retain_withdrawn_attributes
                 } else {
                     true
@@ -1470,6 +1477,24 @@ impl Rib {
         self.recount_flowspec_rules();
     }
 
+    /// Capture a coherent snapshot of matching shared records. The predicate
+    /// runs under the writer mutex and must be inexpensive; decoding, sorting,
+    /// serialization and I/O belong after this method returns. Only matching
+    /// records allocate snapshot slots (one pointer each), with no deep copies.
+    /// Later mutations use copy-on-write while a snapshot retains a record.
+    pub fn evpn_records_matching(
+        &self,
+        matches: impl Fn(&super::evpn::EvpnRecord) -> bool,
+    ) -> Vec<Arc<super::evpn::EvpnRecord>> {
+        self.evpn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|record| matches(record))
+            .cloned()
+            .collect()
+    }
+
     /// Physically remove every record for these ingress ids from the RIB,
     /// reclaiming their memory — as opposed to `withdraw_for_ingresses`, which
     /// only marks them withdrawn (a status bit) and keeps the records around.
@@ -1478,23 +1503,18 @@ impl Rib {
     /// retained previous session before reusing an id. Synthesized BMP peers
     /// that mint a fresh ingress id every session must take this path so
     /// mark-withdraw does not leak one record slot per announced prefix.
-    pub fn evpn_records(&self) -> Vec<super::evpn::EvpnRecord> {
-        self.evpn
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect()
-    }
-
     pub fn remove_for_ingresses(&self, ids: &[IngressId]) {
-        self.evpn
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(_, ingress), _| !ids.contains(ingress));
         if ids.is_empty() {
             return;
         }
+
+        // Build membership outside the EVPN lock: O(I) setup, then O(R)
+        // expected scan cost rather than searching all I ids for each record.
+        let ingress_ids: HashSet<IngressId> = ids.iter().copied().collect();
+        self.evpn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, ingress), _| !ingress_ids.contains(ingress));
 
         // `remove_mui` clears the per-store `withdrawn_muis_bmin` bitmap (via
         // mark_mui_as_active), the same CAS that livelocks under concurrent
@@ -4230,7 +4250,7 @@ mod tests {
             raw.extend_from_slice(&[0; 14]);
             raw.extend_from_slice(&[24, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, vni]);
             RotondaRoute::L2VpnEvpn(
-                EvpnNlri::parse(&raw).unwrap(),
+                Box::new(EvpnNlri::parse(&raw).unwrap()),
                 RotondaPaMap::empty_path_attributes(),
             )
         }
@@ -4246,29 +4266,119 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(rib.evpn_records().len(), 3);
+        assert_eq!(rib.evpn_records_matching(|_| true).len(), 3);
+        rib.remove_for_ingresses(&[]);
+        assert_eq!(rib.evpn_records_matching(|_| true).len(), 3);
+        let snapshot = rib.evpn_records_matching(|r| {
+            r.ingress_id == 1 && r.nlri.rd == "1:1"
+        });
+        assert_eq!(snapshot.len(), 1);
+        let same = rib.evpn_records_matching(|r| {
+            r.ingress_id == 1 && r.nlri.rd == "1:1"
+        });
+        assert!(Arc::ptr_eq(&snapshot[0], &same[0]));
+        drop(same);
+        rib.withdraw_for_ingress(1, Some(AfiSafiType::L2VpnEvpn), true);
+        assert!(snapshot[0].active);
+        assert_eq!(rib.evpn_records_matching(|r| r.active).len(), 1);
+        rib.insert(&route(2, 10), RouteStatus::Active, 0, 1, true, false)
+            .unwrap();
         rib.insert(&route(1, 20), RouteStatus::Active, 1, 1, true, false)
             .unwrap();
-        assert_eq!(rib.evpn_records().len(), 3);
+        assert_eq!(rib.evpn_records_matching(|_| true).len(), 3);
+        let updated_snapshot = rib.evpn_records_matching(|r| {
+            r.ingress_id == 1 && r.nlri.rd == "1:1"
+        });
         rib.insert(&route(1, 0), RouteStatus::Withdrawn, 2, 1, true, false)
             .unwrap();
-        let rows = rib.evpn_records();
+        assert!(updated_snapshot[0].active);
+        assert_eq!(updated_snapshot[0].ltime, 1);
+        assert!(snapshot[0].active);
+        assert_eq!(snapshot[0].nlri.labels, vec![10]);
+        let withdrawn_snapshot = rib.evpn_records_matching(|r| !r.active);
+        assert_eq!(withdrawn_snapshot.len(), 1);
+        let rows = rib.evpn_records_matching(|_| true);
         assert_eq!(rows.iter().filter(|r| r.active).count(), 2);
         assert_eq!(
             rows.iter().find(|r| !r.active).unwrap().nlri.labels,
             vec![20]
         );
         rib.withdraw_for_ingress(1, Some(AfiSafiType::Ipv4Unicast), false);
-        assert_eq!(rib.evpn_records().len(), 3);
+        assert_eq!(rib.evpn_records_matching(|_| true).len(), 3);
         rib.withdraw_for_ingress(1, Some(AfiSafiType::L2VpnEvpn), false);
-        assert_eq!(rib.evpn_records().len(), 1);
+        assert_eq!(rib.evpn_records_matching(|_| true).len(), 1);
         rib.insert(&route(2, 30), RouteStatus::Active, 3, 1, false, false)
             .unwrap();
-        assert_eq!(rib.evpn_records().len(), 2);
-        rib.remove_for_ingresses(&[2]);
-        assert_eq!(rib.evpn_records().len(), 1);
+        assert_eq!(rib.evpn_records_matching(|_| true).len(), 2);
+        rib.remove_for_ingresses(&[2, 999, 2]);
+        assert_eq!(rib.evpn_records_matching(|_| true).len(), 1);
         rib.withdraw_for_ingress(1, None, false);
-        assert!(rib.evpn_records().is_empty());
+        assert!(rib.evpn_records_matching(|_| true).is_empty());
+        assert!(!withdrawn_snapshot[0].active);
+        assert_eq!(withdrawn_snapshot[0].nlri.labels, vec![20]);
+        assert!(snapshot[0].active);
+    }
+
+    #[test]
+    fn evpn_withdrawal_reports_prior_existence() {
+        use super::super::evpn::EvpnNlri;
+
+        let mut raw = vec![5, 34];
+        raw.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1]);
+        raw.extend_from_slice(&[0; 14]);
+        raw.extend_from_slice(&[24, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10]);
+        let route = RotondaRoute::L2VpnEvpn(
+            Box::new(EvpnNlri::parse(&raw).unwrap()),
+            RotondaPaMap::empty_path_attributes(),
+        );
+
+        for retain in [false, true] {
+            let rib = test_rib();
+            let insert = |status, ingress| {
+                rib.insert(&route, status, 0, ingress, retain, false)
+                    .unwrap()
+            };
+            let unknown = insert(RouteStatus::Withdrawn, 1);
+            assert_eq!(unknown.mui_count, 0);
+            assert!(!unknown.prefix_new && !unknown.mui_new);
+
+            let announced = insert(RouteStatus::Active, 1);
+            assert_eq!(announced.mui_count, 1);
+            assert!(announced.prefix_new && announced.mui_new);
+
+            // The same NLRI from another ingress is not a matching record.
+            assert_eq!(insert(RouteStatus::Withdrawn, 2).mui_count, 0);
+            let withdrawn = insert(RouteStatus::Withdrawn, 1);
+            assert_eq!(withdrawn.mui_count, 1);
+            assert!(!withdrawn.prefix_new && !withdrawn.mui_new);
+            assert!(rib.evpn_records_matching(|r| r.active).is_empty());
+
+            // Retained withdrawn records still count as previously known.
+            assert_eq!(
+                insert(RouteStatus::Withdrawn, 1).mui_count,
+                usize::from(retain)
+            );
+            let reannounced = insert(RouteStatus::Active, 1);
+            assert_eq!(reannounced.mui_count, 1);
+            assert_eq!(reannounced.prefix_new, !retain);
+            assert_eq!(reannounced.mui_new, !retain);
+            assert_eq!(rib.evpn_records_matching(|r| r.active).len(), 1);
+        }
+    }
+
+    #[test]
+    fn evpn_shared_record_sizes() {
+        use super::super::evpn::EvpnRecord;
+        println!("EvpnRecord={} inline map value -> shared map value={}, Arc counters={} bytes per allocation; RotondaRoute={}, Payload={}",
+            std::mem::size_of::<EvpnRecord>(),
+            std::mem::size_of::<Arc<EvpnRecord>>(),
+            2 * std::mem::size_of::<usize>(),
+            std::mem::size_of::<RotondaRoute>(),
+            std::mem::size_of::<crate::payload::Payload>());
+        assert_eq!(
+            std::mem::size_of::<Arc<EvpnRecord>>(),
+            std::mem::size_of::<usize>()
+        );
     }
 
     fn test_rib() -> Rib {
